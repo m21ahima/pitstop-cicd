@@ -1,0 +1,22 @@
+{
+  "name": "pitstop-cicd",
+  "version": "1.0.0",
+  "description": "A tiny self-narrating deploy pipeline with replayable runs.",
+  "bin": {
+    "pitstop": "bin/pitstop.js"
+  },
+  "main": "bin/pitstop.js",
+  "dependencies": {
+    "chalk": "^4.1.2"
+  },
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

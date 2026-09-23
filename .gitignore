@@ -1,0 +1,5 @@
+node_modules/
+sample-app/node_modules/
+logs/*.jsonl
+logs/current.json
+logs/latest.txt
