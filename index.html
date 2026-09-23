@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pit Stop — Deploy Pipeline</title>
+<style>
+:root{
+  --bg:#0b0f17; --panel:#131a26; --line:#22303f; --text:#e6edf3; --dim:#7d8b9a;
+  --ok:#3ddc84; --fail:#ff5d5d; --run:#f5c451; --blue:#4f8cff; --green:#3ddc84;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+.wrap{max-width:960px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:22px;margin:0 0 4px}
+.sub{color:var(--dim);font-size:14px;margin-bottom:24px}
+.controls{display:flex;gap:10px;margin-bottom:28px;flex-wrap:wrap}
+button{
+  background:var(--panel);border:1px solid var(--line);color:var(--text);
+  padding:10px 16px;border-radius:8px;font-size:14px;cursor:pointer;
+}
+button:hover{border-color:var(--blue)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.pipeline{display:flex;gap:10px;overflow-x:auto;padding-bottom:8px;margin-bottom:28px}
+.step{
+  flex:1;min-width:140px;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;padding:14px;text-align:center;transition:all .25s;
+}
+.step .icon{font-size:22px;margin-bottom:6px;display:block}
+.step .name{font-weight:600;font-size:13px;letter-spacing:.5px}
+.step .msg{font-size:11px;color:var(--dim);margin-top:6px;min-height:14px}
+.step.running{border-color:var(--run);box-shadow:0 0 0 1px var(--run)}
+.step.ok{border-color:var(--ok);box-shadow:0 0 0 1px var(--ok)}
+.step.fail{border-color:var(--fail);box-shadow:0 0 0 1px var(--fail)}
+
+.servers{display:flex;gap:16px;align-items:center;justify-content:center;margin-bottom:20px;flex-wrap:wrap}
+.server{
+  width:220px;background:var(--panel);border:2px solid var(--line);border-radius:12px;
+  padding:18px;text-align:center;position:relative;transition:all .3s;
+}
+.server .tag{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+.server .label{font-size:16px;font-weight:700;margin:6px 0}
+.server .port{font-size:12px;color:var(--dim)}
+.server .status{margin-top:10px;font-size:12px;padding:4px 10px;border-radius:20px;display:inline-block}
+.server.old{border-color:var(--blue)}
+.server.new{border-color:var(--line)}
+.server.live{box-shadow:0 0 18px rgba(61,220,132,.35)}
+.server.dead{opacity:.35}
+.status.healthy{background:rgba(61,220,132,.15);color:var(--ok)}
+.status.unhealthy{background:rgba(255,93,93,.15);color:var(--fail)}
+.status.pending{background:rgba(245,196,81,.15);color:var(--run)}
+.status.none{background:rgba(125,139,154,.15);color:var(--dim)}
+
+.traffic{font-size:13px;color:var(--dim);text-align:center;margin-bottom:28px}
+.traffic b{color:var(--ok)}
+
+.log{
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px;font-family:'Consolas','Courier New',monospace;font-size:13px;
+  min-height:140px;max-height:220px;overflow-y:auto;
+}
+.log .line{margin-bottom:4px;opacity:0;animation:fadeIn .3s forwards}
+.log .ok{color:var(--ok)} .log .fail{color:var(--fail)} .log .run{color:var(--run)}
+@keyframes fadeIn{to{opacity:1}}
+.result{
+  margin-top:16px;padding:14px 16px;border-radius:10px;font-weight:600;font-size:14px;
+  display:none;
+}
+.result.show{display:block}
+.result.ok{background:rgba(61,220,132,.12);color:var(--ok);border:1px solid var(--ok)}
+.result.fail{background:rgba(255,93,93,.12);color:var(--fail);border:1px solid var(--fail)}
+.legend{display:flex;gap:18px;font-size:12px;color:var(--dim);margin-top:10px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🏁 Pit Stop — Self-Narrating Deploy Pipeline</h1>
+  <div class="sub">Build → Test → Deploy → Healthcheck → auto-rollback, with zero-downtime blue-green switching.</div>
+
+  <div class="controls">
+    <button id="btnGood">▶ Simulate Good Deploy</button>
+    <button id="btnBad">▶ Simulate Broken Deploy</button>
+    <button id="btnReset">↺ Reset</button>
+  </div>
+
+  <div class="pipeline" id="pipeline"></div>
+
+  <div class="servers">
+    <div class="server old" id="srvOld">
+      <div class="tag">Currently Live</div>
+      <div class="label">Old Version</div>
+      <div class="port" id="oldPort">port 4000</div>
+      <div class="status healthy" id="oldStatus">healthy</div>
+    </div>
+    <div class="server new dead" id="srvNew">
+      <div class="tag">Candidate</div>
+      <div class="label">New Version</div>
+      <div class="port" id="newPort">not started</div>
+      <div class="status none" id="newStatus">—</div>
+    </div>
+  </div>
+  <div class="traffic" id="trafficMsg">Real user traffic is currently going to <b>Old Version</b>.</div>
+
+  <div class="log" id="log"></div>
+  <div class="result" id="result"></div>
+  <div class="legend">
+    <span>🟡 running</span><span>🟢 passed</span><span>🔴 failed / rolled back</span>
+  </div>
+</div>
+
+<script>
+const steps = [
+  {key:'build', name:'BUILD', icon:'📦'},
+  {key:'test', name:'TEST', icon:'🧪'},
+  {key:'deploy', name:'DEPLOY', icon:'🚀'},
+  {key:'health', name:'HEALTHCHECK', icon:'❤️'},
+  {key:'decide', name:'DECISION', icon:'⚖️'},
+];
+
+const pipelineEl = document.getElementById('pipeline');
+steps.forEach(s=>{
+  const div = document.createElement('div');
+  div.className = 'step';
+  div.id = 'step-'+s.key;
+  div.innerHTML = `<span class="icon">${s.icon}</span><span class="name">${s.name}</span><span class="msg" id="msg-${s.key}"></span>`;
+  pipelineEl.appendChild(div);
+});
+
+const logEl = document.getElementById('log');
+const resultEl = document.getElementById('result');
+const btnGood = document.getElementById('btnGood');
+const btnBad = document.getElementById('btnBad');
+const btnReset = document.getElementById('btnReset');
+
+let oldPort = 4000, newPort = 4001, running = false;
+
+function setStep(key, state, msg){
+  const el = document.getElementById('step-'+key);
+  el.className = 'step ' + state;
+  if(msg) document.getElementById('msg-'+key).textContent = msg;
+}
+function resetSteps(){
+  steps.forEach(s=>{ setStep(s.key,''); document.getElementById('msg-'+s.key).textContent=''; });
+}
+function addLog(text, cls){
+  const line = document.createElement('div');
+  line.className = 'line ' + (cls||'');
+  line.textContent = text;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function wait(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+function updateServers({newHealthy, newLive}){
+  document.getElementById('oldPort').textContent = 'port ' + oldPort;
+  document.getElementById('newPort').textContent = newLive === undefined ? 'not started' : 'port ' + newPort;
+
+  const oldEl = document.getElementById('srvOld');
+  const newEl = document.getElementById('srvNew');
+  const oldStatusEl = document.getElementById('oldStatus');
+  const newStatusEl = document.getElementById('newStatus');
+  const trafficEl = document.getElementById('trafficMsg');
+
+  if(newLive === true){
+    oldEl.classList.remove('live'); oldEl.classList.add('dead');
+    newEl.classList.remove('dead'); newEl.classList.add('live');
+    oldStatusEl.className='status none'; oldStatusEl.textContent='stopped';
+    newStatusEl.className='status healthy'; newStatusEl.textContent='healthy — live';
+    trafficEl.innerHTML = 'Real user traffic switched to <b>New Version</b>.';
+  } else if(newLive === false){
+    newEl.classList.remove('dead');
+    newStatusEl.className='status unhealthy'; newStatusEl.textContent='unhealthy — rejected';
+    oldStatusEl.className='status healthy'; oldStatusEl.textContent='healthy — still live';
+    oldEl.classList.add('live');
+    trafficEl.innerHTML = 'Traffic stayed on <b>Old Version</b> the entire time. Zero downtime.';
+  }
+}
+
+async function runPipeline(broken){
+  if(running) return;
+  running = true;
+  btnGood.disabled = true; btnBad.disabled = true;
+  logEl.innerHTML = ''; resultEl.className = 'result'; resultEl.textContent='';
+  resetSteps();
+  document.getElementById('srvNew').className = 'server new dead';
+  document.getElementById('newStatus').className = 'status none';
+  document.getElementById('newStatus').textContent = '—';
+  document.getElementById('newPort').textContent = 'not started';
+  document.getElementById('trafficMsg').innerHTML = 'Real user traffic is currently going to <b>Old Version</b>.';
+
+  setStep('build','running'); addLog('➡️  BUILD        Installing dependencies...','run');
+  await wait(700);
+  setStep('build','ok'); addLog('✅ BUILD        Dependencies installed.','ok');
+
+  setStep('test','running'); addLog('➡️  TEST         Running test suite...','run');
+  await wait(600);
+  setStep('test','ok'); addLog('✅ TEST         All tests passed.','ok');
+  if(broken) addLog('   (note: tests don\'t check /health — this bug slips through)','run');
+
+  setStep('deploy','running'); addLog(`➡️  DEPLOY       Starting new instance on port ${newPort}...`,'run');
+  await wait(600);
+  setStep('deploy','ok'); addLog(`✅ DEPLOY       New instance started on port ${newPort}.`,'ok');
+  updateServers({});
+  document.getElementById('newPort').textContent = 'port ' + newPort;
+  document.getElementById('newStatus').className='status pending';
+  document.getElementById('newStatus').textContent='starting...';
+
+  setStep('health','running');
+  for(let i=1;i<=(broken?5:2);i++){
+    addLog(`➡️  HEALTHCHECK  Attempt ${i}/5...`,'run');
+    await wait(450);
+  }
+
+  if(broken){
+    setStep('health','fail'); addLog('❌ HEALTHCHECK  Unhealthy after 5 attempts.','fail');
+    setStep('decide','fail','Rolled back');
+    addLog('➡️  ROLLBACK     New version failed — rolling back...','run');
+    await wait(500);
+    addLog(`✅ ROLLBACK     Old version still live on port ${oldPort}. No downtime.`,'ok');
+    updateServers({newLive:false});
+    resultEl.className = 'result show fail';
+    resultEl.textContent = '❌ Deploy rejected — broken version never reached users.';
+  } else {
+    setStep('health','ok'); addLog('✅ HEALTHCHECK  New version is healthy.','ok');
+    setStep('decide','ok','Live');
+    addLog('➡️  SWITCH       Routing traffic to new version...','run');
+    await wait(500);
+    addLog(`✅ SWITCH       Old version stopped. New version now live on port ${newPort}.`,'ok');
+    updateServers({newLive:true});
+    [oldPort,newPort] = [newPort, oldPort===4000?4001:4000];
+    resultEl.className = 'result show ok';
+    resultEl.textContent = '✅ Deploy successful — new version now serving live traffic.';
+  }
+
+  running = false;
+  btnGood.disabled = false; btnBad.disabled = false;
+}
+
+btnGood.addEventListener('click', ()=>runPipeline(false));
+btnBad.addEventListener('click', ()=>runPipeline(true));
+btnReset.addEventListener('click', ()=>{
+  oldPort=4000; newPort=4001;
+  resetSteps(); logEl.innerHTML=''; resultEl.className='result'; resultEl.textContent='';
+  document.getElementById('srvOld').className='server old live';
+  document.getElementById('oldStatus').className='status healthy'; document.getElementById('oldStatus').textContent='healthy';
+  document.getElementById('oldPort').textContent='port 4000';
+  document.getElementById('srvNew').className='server new dead';
+  document.getElementById('newStatus').className='status none'; document.getElementById('newStatus').textContent='—';
+  document.getElementById('newPort').textContent='not started';
+  document.getElementById('trafficMsg').innerHTML='Real user traffic is currently going to <b>Old Version</b>.';
+});
+document.getElementById('srvOld').classList.add('live');
+</script>
+</body>
+</html>
