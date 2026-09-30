@@ -24,7 +24,7 @@ The new version never touches real traffic until it's proven healthy. If it fail
 - **`bin/pitstop.js`** — the checklist-runner. Run `node bin/pitstop.js deploy` and it walks through all 5 steps live in your terminal.
 - **`lib/`** — the logic behind each step (build, test, deploy, healthcheck, rollback), plus a logger that records every run.
 - **`logs/`** — every deploy gets saved as a `.jsonl` file. Run `node bin/pitstop.js replay` to watch any past deploy again, step by step, with real timing.
-- **`visual/pitstop-visual.html`** — a visual, animated version of the same pipeline for demos — no terminal needed. [Live demo →](#) *(add your GitHub Pages link here)*
+- **`visual/pitstop-visual.html`** — a visual, animated version of the same pipeline for demos — no terminal needed. [Live demo →](https://m21ahima.github.io/pitstop-cicd/) 
 
 ## Try it yourself
 
