@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pit Wall — Live Deploy Simulator</title>
+<style>
+:root{--bg:#120a2a;--panel:#1b1040;--line:#ff6fb5;--text:#fff;--dim:#b9a8e6;--ok:#76ff03;--fail:#ff3d81;--run:#ffe600}
+*{box-sizing:border-box}
+body{margin:0;color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;background:radial-gradient(circle at 15% 0%,#3b1a73,#120a2a 60%) fixed}
+.wrap{max-width:1000px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:28px;margin:0;font-weight:900;letter-spacing:1px;background:linear-gradient(90deg,#ff3d81,#ffe600,#00e5ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{color:var(--dim);font-size:13px;margin:4px 0 16px}
+canvas{width:100%;height:auto;border:2px solid #ff6fb5;border-radius:14px;display:block;box-shadow:0 0 28px rgba(255,61,129,.45)}
+.row{display:flex;gap:14px;margin-top:14px;flex-wrap:wrap}
+.card{background:var(--panel);border:1.5px solid rgba(255,111,181,.5);border-radius:12px;padding:14px;flex:1;min-width:260px;box-shadow:0 0 18px rgba(0,229,255,.12)}
+.card h2{font-size:12px;color:#00e5ff;letter-spacing:2px;text-transform:uppercase;margin:0 0 10px}
+.stat{display:flex;justify-content:space-between;font-size:14px;padding:4px 0;gap:12px}
+.stat b{font-variant-numeric:tabular-nums;text-align:right}
+.sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
+#radio{font-family:Consolas,monospace;font-size:12.5px;height:190px;overflow-y:auto}
+#radio div{margin-bottom:5px}
+.ok{color:var(--ok)}.fail{color:var(--fail)}.run{color:var(--run)}
+.note{color:var(--dim);font-size:12px;margin-top:10px;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🏁 Pit Wall</h1>
+  <div class="sub">Cars are traffic. A pit stop is a deploy. The race never stops.</div>
+  <canvas id="track" width="900" height="520"></canvas>
+  <div class="row">
+    <div class="card"><h2>Pit radio</h2><div id="radio"></div></div>
+    <div class="card">
+      <h2>Race stats (simulated)</h2>
+      <div class="stat"><span>Live version</span><b id="sLive"></b></div>
+      <div class="stat"><span>Fleet</span><b id="sFleet"></b></div>
+      <div class="stat"><span>Cars racing</span><b id="sTrack"></b></div>
+      <div class="stat"><span>Requests/sec</span><b id="sRps"></b></div>
+      <div class="stat"><span>Downtime</span><b id="sDown">0.0s</b></div>
+      <div class="stat"><span>Deploys passed / rolled back</span><b id="sDeploys"></b></div>
+      <div class="note">Traffic and deploys here are a simulated timeline. Every 3rd deploy is deliberately bad to show the rollback. Later, the real proxy will send the same events through <code>pitWall.emit()</code>.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('track');
+const ctx = cv.getContext('2d');
+const W = 900, H = 520, cx = 450, cy = 260, L = 340, R = 150;
+const P = 2 * L + 2 * Math.PI * R;           // track length
+const dpr = window.devicePixelRatio || 1;
+cv.width = W * dpr; cv.height = H * dpr; ctx.scale(dpr, dpr);
+
+// ---------- geometry ----------
+const PIT_Y = cy + R - 64, BOX = { x: cx, y: PIT_Y };
+const ENTRY_S = L / 2 - 110, EXIT_S = L / 2 + 110;
+const EXIT = { x: cx + 110, y: cy + R - 9 };
+
+function getPoint(s, off) {                   // off > 0 = outside lane
+  s = ((s % P) + P) % P;
+  if (s < L) return { x: cx - L / 2 + s, y: cy + R + off, ang: 0 };
+  s -= L;
+  if (s < Math.PI * R) {
+    const th = Math.PI / 2 - s / R;
+    return { x: cx + L / 2 + (R + off) * Math.cos(th), y: cy + (R + off) * Math.sin(th), ang: th - Math.PI / 2 };
+  }
+  s -= Math.PI * R;
+  if (s < L) return { x: cx + L / 2 - s, y: cy - R - off, ang: Math.PI };
+  s -= L;
+  const th = -Math.PI / 2 - s / R;
+  return { x: cx - L / 2 + (R + off) * Math.cos(th), y: cy + (R + off) * Math.sin(th), ang: th - Math.PI / 2 };
+}
+
+// ---------- state ----------
+const PALETTE = ['#ff3d81', '#00e5ff', '#ffe600', '#b388ff', '#76ff03', '#ff9100', '#40c4ff'];
+const COLORS = {};
+const colorOf = v => COLORS[v] || (COLORS[v] = PALETTE[Object.keys(COLORS).length % PALETTE.length]);
+const OFFS = [-26, -9, 9, 26];
+const cars = [];
+for (let i = 0; i < 20; i++) {
+  cars.push({ id: i + 1, s: i * P / 20, off: OFFS[i % 4], spd: 150 + Math.random() * 40,
+              ver: 'v41', state: 'track', t: 0, from: null, flash: 0 });
+}
+colorOf('v41');
+let live = 'v41', pitCar = null, busy = false, smoking = false, label = null;
+let downtime = 0, passed = 0, failed = 0, statTimer = 0;
+const smoke = [];
+
+// ---------- pit radio ----------
+const radioEl = document.getElementById('radio');
+function radio(msg, cls, tag) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = `[${tag}] ${msg}`;
+  radioEl.appendChild(d);
+  while (radioEl.children.length > 40) radioEl.removeChild(radioEl.firstChild);
+  radioEl.scrollTop = radioEl.scrollHeight;
+}
+const pad = n => String(n).padStart(2, '0');
+
+// ---------- events (the real proxy will send these later) ----------
+function emit(e) {
+  if (e.type === 'deploy_start') {
+    busy = true;
+    const pool = cars.filter(c => c.state === 'track' && c.ver === live);
+    pitCar = pool.reduce((a, b) => ((ENTRY_S - b.s + P) % P < (ENTRY_S - a.s + P) % P ? b : a));
+    pitCar.state = 'heading';
+    label = { text: 'DEPLOYING ' + e.version, color: '#ffe600' };
+    showBanner('PIT STOP!', '#ffe600');
+    radio(`Deploying ${e.version} — car #${pad(pitCar.id)} into pit lane. 19 cars still racing.`, 'run', 'PIT');
+  }
+  if (e.type === 'healthcheck') {
+    radio(`Healthcheck on ${e.version}...`, 'run', 'PIT');
+  }
+  if (e.type === 'healthy') {
+    radio(`${e.version} healthy. Car #${pad(pitCar.id)} exits, upgrading the rest of the field.`, 'ok', 'PIT');
+    pitCar.ver = e.version; pitCar.flash = 1; pitCar.state = 'exiting'; pitCar.t = 0;
+    label = null; passed++; showBanner(e.version + ' GO!', '#00e5ff'); sparkle(pitCar, 14);
+    rollout(e.version);
+  }
+  if (e.type === 'failed') {
+    radio(`${e.version} FAILED, rolling back to ${live}`, 'fail', 'RADIO');
+    smoking = true; failed++; showBanner('FAILED!', '#ff3d81'); burst(BOX.x, BOX.y);
+    label = { text: e.version + ' FAILED', color: '#ff3d81' };
+    setTimeout(() => {
+      smoking = false; label = null;
+      pitCar.state = 'exiting'; pitCar.t = 0;
+      radio(`Car #${pad(pitCar.id)} back out on ${live}. Other cars never noticed.`, 'ok', 'PIT');
+      busy = false;
+    }, 2500);
+  }
+}
+function rollout(version) {
+  const queue = cars.filter(c => c !== pitCar);
+  const timer = setInterval(() => {
+    const c = queue.shift();
+    if (!c) {
+      clearInterval(timer); live = version; busy = false;
+      radio(`All cars on ${version}. Zero downtime.`, 'ok', 'PIT');
+      return;
+    }
+    c.ver = version; c.flash = 0.6; sparkle(c, 5);
+  }, 350);
+}
+window.pitWall = { emit };
+
+// ---------- simulated timeline ----------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function scenario() {
+  let n = 41, count = 0;
+  radio('Race started. All 20 cars on v41.', 'ok', 'PIT');
+  await sleep(3000);
+  while (true) {
+    const next = 'v' + (++n), bad = ++count % 3 === 0;
+    emit({ type: 'deploy_start', version: next });
+    await sleep(3600);
+    emit({ type: 'healthcheck', version: next });
+    await sleep(1800);
+    emit({ type: bad ? 'failed' : 'healthy', version: next });
+    await sleep(1000);
+    while (busy) await sleep(300);
+    await sleep(3500);
+  }
+}
+
+// ---------- update ----------
+const ease = t => t * t * (3 - 2 * t);
+function update(dt) {
+  let racing = 0;
+  for (const c of cars) {
+    if (c.flash > 0) c.flash -= dt;
+    if (c.state === 'track') { c.s = (c.s + c.spd * dt) % P; racing++; }
+    else if (c.state === 'heading') {
+      const ds = c.spd * dt, d = (ENTRY_S - c.s + P) % P;
+      if (d <= ds) { c.state = 'entering'; c.t = 0; c.from = getPoint(ENTRY_S, c.off); }
+      else c.s = (c.s + ds) % P;
+      racing++;
+    }
+    else if (c.state === 'entering') { c.t += dt / 1.6; if (c.t >= 1) c.state = 'box'; }
+    else if (c.state === 'exiting') {
+      c.t += dt / 1.6;
+      if (c.t >= 1) { c.state = 'track'; c.s = EXIT_S; c.off = -9; }
+    }
+  }
+  if (smoking) {
+    for (let i = 0; i < 2; i++) smoke.push({ x: BOX.x + (Math.random() - .5) * 10, y: BOX.y - 6,
+      vx: (Math.random() - .5) * 18, vy: -22 - Math.random() * 18, r: 4 + Math.random() * 4, a: .7 });
+  }
+  for (let i = smoke.length - 1; i >= 0; i--) {
+    const p = smoke[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.r += 8 * dt; p.a -= .35 * dt;
+    if (p.a <= 0) smoke.splice(i, 1);
+  }
+  updateFx(dt);
+  if (racing === 0) downtime += dt;
+  statTimer += dt;
+  if (statTimer > .5) { statTimer = 0; renderStats(racing); }
+}
+
+function renderStats(racing) {
+  const counts = {};
+  cars.forEach(c => counts[c.ver] = (counts[c.ver] || 0) + 1);
+  document.getElementById('sLive').innerHTML = `<span class="sw" style="background:${colorOf(live)}"></span>${live}`;
+  document.getElementById('sFleet').textContent = Object.keys(counts).sort()
+    .map(v => `${v} ×${counts[v]}`).join(' · ');
+  document.getElementById('sTrack').textContent = `${racing} / 20`;
+  document.getElementById('sRps').textContent = Math.round(racing * 2.5 + Math.random() * 4);
+  document.getElementById('sDown').textContent = downtime.toFixed(1) + 's';
+  document.getElementById('sDeploys').textContent = `${passed} / ${failed}`;
+}
+
+// ---------- draw ----------
+function carPos(c) {
+  if (c.state === 'track' || c.state === 'heading') return getPoint(c.s, c.off);
+  if (c.state === 'box') return { x: BOX.x, y: BOX.y, ang: 0 };
+  const e = ease(Math.min(c.t, 1));
+  const a = c.state === 'entering' ? c.from : BOX, b = c.state === 'entering' ? BOX : EXIT;
+  return { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e, ang: 0 };
+}
+
+// effects
+const petals = Array.from({ length: 26 }, () => ({ x: Math.random() * W, y: Math.random() * H, v: 20 + Math.random() * 30, r: 2 + Math.random() * 2.5, ph: Math.random() * 6 }));
+const sparks = [];
+let banner = null;
+function showBanner(text, color) { banner = { text, color, t: 0 }; }
+function sparkle(c, n) {
+  const p = carPos(c);
+  for (let i = 0; i < n; i++) sparks.push({ x: p.x, y: p.y, vx: (Math.random() - .5) * 90, vy: -20 - Math.random() * 70, life: 1, c: ['#fff', '#ffe600', '#00e5ff', '#ff3d81'][i % 4], star: true });
+}
+function burst(x, y) {
+  for (let i = 0; i < 30; i++) {
+    const a = Math.random() * 6.28, sp = 60 + Math.random() * 140;
+    sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, c: ['#ff9100', '#ffe600', '#ff3d81'][i % 3], star: false });
+  }
+}
+function updateFx(dt) {
+  petals.forEach(p => {
+    p.ph += dt; p.y += p.v * dt; p.x += (14 + Math.sin(p.ph * 1.5) * 18) * dt;
+    if (p.y > H + 10) { p.y = -10; p.x = Math.random() * W; }
+    if (p.x > W + 10) p.x = -10;
+  });
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i]; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 60 * dt; s.life -= dt * 1.2;
+    if (s.life <= 0) sparks.splice(i, 1);
+  }
+  if (banner) { banner.t += dt; if (banner.t > 1.8) banner = null; }
+}
+
+// static background, drawn once
+const bg = document.createElement('canvas'); bg.width = W * dpr; bg.height = H * dpr;
+function buildBg() {
+  const g = bg.getContext('2d'); g.scale(dpr, dpr);
+  const sky = g.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#1b0b4a'); sky.addColorStop(.55, '#6a2fa0'); sky.addColorStop(1, '#ff6fb5');
+  g.fillStyle = sky; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < 70; i++) { g.fillStyle = `rgba(255,255,255,${Math.random() * .8})`; g.fillRect(Math.random() * W, Math.random() * H * .5, 1.5, 1.5); }
+
+  g.save(); g.beginPath(); g.roundRect(cx - L / 2 - R + 46, cy - R + 46, L + 2 * R - 92, 2 * R - 92, R - 46); g.clip();
+  for (let x = 0; x < W; x += 30) { g.fillStyle = (x / 30) % 2 ? '#19c37d' : '#22d98c'; g.fillRect(x, 0, 30, H); }
+  g.restore();
+
+  const path = () => { g.beginPath(); g.roundRect(cx - L / 2 - R, cy - R, L + 2 * R, 2 * R, R); };
+  path(); g.lineWidth = 106; g.strokeStyle = '#00e5ff'; g.shadowColor = '#00e5ff'; g.shadowBlur = 26; g.stroke(); g.shadowBlur = 0;
+  path(); g.lineWidth = 98; g.strokeStyle = '#ff3d81'; g.setLineDash([20, 20]); g.stroke();
+  g.lineDashOffset = 20; g.strokeStyle = '#fff'; g.stroke(); g.lineDashOffset = 0; g.setLineDash([]);
+  path(); g.lineWidth = 88; g.strokeStyle = '#2b2d4a'; g.stroke();
+  path(); g.lineWidth = 2; g.strokeStyle = 'rgba(255,230,0,.55)'; g.setLineDash([16, 18]); g.stroke(); g.setLineDash([]);
+
+  const fx = cx - 150, fy = cy + R - 44;                       // checkered start/finish line
+  for (let r = 0; r < 6; r++) for (let k = 0; k < 2; k++) { g.fillStyle = (r + k) % 2 ? '#fff' : '#12082e'; g.fillRect(fx + k * 7, fy + r * 14.67, 7, 14.67); }
+
+  g.fillStyle = '#1a1240'; g.strokeStyle = '#ffe600'; g.lineWidth = 2; g.shadowColor = '#ffe600'; g.shadowBlur = 12;
+  g.beginPath(); g.roundRect(cx - 120, PIT_Y - 14, 240, 28, 8); g.fill(); g.stroke(); g.shadowBlur = 0;
+  g.fillStyle = '#ff6fb5'; g.font = 'bold 11px Segoe UI, sans-serif'; g.textAlign = 'center'; g.fillText('PIT LANE', cx - 80, PIT_Y + 4);
+
+  g.globalAlpha = .4; g.font = '900 58px Segoe UI, sans-serif';
+  const tg = g.createLinearGradient(cx - 120, 0, cx + 120, 0); tg.addColorStop(0, '#ff3d81'); tg.addColorStop(1, '#00e5ff');
+  g.fillStyle = tg; g.fillText('PIT WALL', cx, cy + 22);
+  g.font = '16px Yu Gothic, Meiryo, sans-serif'; g.fillStyle = '#fff'; g.fillText('ピットウォール', cx, cy + 46);
+  g.globalAlpha = 1;
+}
+
+function comicText(text, x, y, size, color) {
+  ctx.font = `900 ${size}px 'Segoe UI', sans-serif`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  ctx.lineWidth = size / 4; ctx.strokeStyle = '#12082e'; ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+
+function drawCar(c) {
+  const p = carPos(c), col = colorOf(c.ver);
+  ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.ang);
+  if (c.state === 'track' || c.state === 'heading') {           // speed streak
+    const gr = ctx.createLinearGradient(-32, 0, -9, 0);
+    gr.addColorStop(0, 'rgba(255,255,255,0)'); gr.addColorStop(1, col);
+    ctx.globalAlpha = .6; ctx.fillStyle = gr; ctx.fillRect(-32, -2.5, 23, 5); ctx.globalAlpha = 1;
+  }
+  ctx.scale(1.2, 1.2);
+  ctx.fillStyle = '#12082e';                                      // wheels + wings
+  [[-7, -7], [-7, 4], [3, -7], [3, 4]].forEach(([x, y]) => ctx.fillRect(x, y, 6, 3));
+  ctx.fillRect(-12, -6, 3, 12); ctx.fillRect(9, -6, 3, 12);
+  ctx.shadowColor = col; ctx.shadowBlur = 10; ctx.fillStyle = col; ctx.strokeStyle = '#12082e'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(-9, -3.5); ctx.lineTo(3, -3.5); ctx.lineTo(11, -1.2); ctx.lineTo(11, 1.2); ctx.lineTo(3, 3.5); ctx.lineTo(-9, 3.5); ctx.closePath();
+  ctx.fill(); ctx.shadowBlur = 0; ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(-7, -1.8); ctx.lineTo(5, -1.8); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, 0, 2.6, 0, 7); ctx.fill();   // helmet
+  ctx.fillStyle = '#12082e'; ctx.fillRect(.6, -1.6, 2, 3.2);                       // visor
+  if (c.flash > 0) { ctx.globalAlpha = Math.min(c.flash, 1); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, 14, 0, 7); ctx.stroke(); }
+  ctx.restore();
+}
+
+function drawCrew(now) {
+  const cols = ['#ffe600', '#00e5ff', '#ff3d81', '#76ff03'];
+  [[-24, -5], [-24, 8], [24, -5], [24, 8]].forEach(([dx, dy], i) => {
+    const bob = Math.sin(now * (smoking ? 22 : 9) + i * 1.7) * (smoking ? 3 : 2);
+    ctx.fillStyle = cols[i]; ctx.strokeStyle = '#12082e'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(BOX.x + dx, BOX.y + dy + bob, 5, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(BOX.x + dx, BOX.y + dy + bob - 1.5, 2, 0, 7); ctx.fill();
+    if (smoking) comicText('!', BOX.x + dx, BOX.y + dy + bob - 9, 12, '#ff3d81');
+  });
+}
+
+function draw() {
+  const now = performance.now() / 1000;
+  ctx.drawImage(bg, 0, 0, W, H);
+  petals.forEach(p => {
+    ctx.fillStyle = 'rgba(255,190,220,.85)'; ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.ph);
+    ctx.beginPath(); ctx.ellipse(0, 0, p.r * 1.6, p.r, 0, 0, 7); ctx.fill(); ctx.restore();
+  });
+
+  cars.forEach(drawCar);
+  if (pitCar && pitCar.state === 'box') drawCrew(now);
+
+  smoke.forEach(p => {
+    ctx.fillStyle = `rgba(215,205,235,${Math.max(p.a, 0)})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  });
+  sparks.forEach(s => {
+    ctx.globalAlpha = Math.max(s.life, 0); ctx.fillStyle = s.c;
+    if (s.star) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('✦', s.x, s.y); }
+    else { ctx.beginPath(); ctx.arc(s.x, s.y, 3, 0, 7); ctx.fill(); }
+    ctx.globalAlpha = 1;
+  });
+  if (smoking) {
+    ctx.strokeStyle = `rgba(255,61,129,${.5 + .4 * Math.sin(now * 8)})`;
+    ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(BOX.x, BOX.y, 20, 0, 7); ctx.stroke();
+  }
+  if (label && pitCar && (pitCar.state === 'box' || pitCar.state === 'entering')) comicText(label.text, BOX.x, BOX.y - 30, 15, label.color);
+  if (banner) {
+    const pop = 1 + Math.max(0, .35 - banner.t * 1.2), fade = banner.t > 1.4 ? (1.8 - banner.t) / .4 : 1;
+    ctx.save(); ctx.globalAlpha = fade; ctx.translate(cx, cy - 52); ctx.rotate(-.07); ctx.scale(pop, pop);
+    comicText(banner.text, 0, 0, 54, banner.color); ctx.restore();
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, .05); last = now;
+  update(dt); draw(); requestAnimationFrame(frame);
+}
+buildBg();
+requestAnimationFrame(frame);
+scenario();
+</script>
+</body>
+</html>
